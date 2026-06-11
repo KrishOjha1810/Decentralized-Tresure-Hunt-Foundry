@@ -1,141 +1,122 @@
-# TreasureHunt — On-chain Treasure Hunt Game (Foundry + Solidity)
+# Treasure Hunt
 
-A small on-chain game where multiple players move on a 10×10 grid trying to find a hidden treasure.
-The treasure moves dynamically based on player moves and simple deterministic rules so the game is **provably fair** (within the limits of on-chain randomness from `blockhash`).
+A fully on-chain, multiplayer treasure hunt on a 10x10 grid, where the prize moves as players chase it.
 
----
+![Solidity](https://img.shields.io/badge/Solidity-0.8.20-363636?logo=solidity&logoColor=white)
+![Foundry](https://img.shields.io/badge/Built%20with-Foundry-FE5421)
+![License](https://img.shields.io/badge/License-Unlicense-blue)
 
-## 🔖 Quick summary
+## Overview
 
-- Grid: `10 x 10` (positions `0`..`99`), players have `(row, col)` coordinates.
-- Players join by paying an ETH `joinFee` (configurable at deployment).
-- Each player may move once per turn to an **adjacent** cell (up/down/left/right).
-- Treasure:
-  - Initially seeded with `keccak256(block.number, block.timestamp)` and `blockhash(block.number - 1)`.
-  - Moves whenever a player moves according to:
-    - If the player's new position (index = `row * 10 + col`) is **multiple of 5**, the treasure moves to a random **adjacent** cell.
-    - If the player's new position is a **prime** number, the treasure teleports to a new random position on the grid.
-  - Duplicate numbers and repeated draws have no extra effect.
-- Winning: If a player moves to the cell where the treasure is located, they immediately win:
-  - Winner receives **90%** of the contract balance.
-  - **10%** remains in contract as reserve for future rounds.
-- Owner functions:
-  - `withdraw()` to withdraw leftover funds (onlyOwner).
-  - (Owner is set at construction using `Ownable`).
+Treasure Hunt is a Solidity smart contract game built and tested with Foundry. Players join by paying an ETH fee, then take turns walking one cell at a time across a 10x10 grid. A hidden treasure sits somewhere on that grid, and the goal is simple: step onto the treasure's cell to win.
 
----
+The twist is that the treasure is not static. Every player move can nudge or teleport the treasure based on deterministic on-chain rules, so the target keeps shifting as the hunt unfolds. All game state lives on-chain and is derived purely from chain data (`block.number`, `block.timestamp`, and `blockhash`), which keeps the game transparent and reproducible from the chain's history.
 
-## ⚙️ How randomness is handled (design notes)
+The first player to land on the treasure's cell takes 90% of the contract balance as the prize, while the remaining 10% stays in the contract as a reserve.
 
-- **On-chain determinism** is used: `keccak256` + `blockhash(block.number - 1)` and `block.timestamp` are the entropy sources.
-  - Example seed: `uint8(uint256(keccak256(abi.encodePacked(block.timestamp, block.number))) % 10)`
-- This is **not** secure against a miner who can influence `block.timestamp` or which transactions get included — but for the assignment and low-stakes testnets it is acceptable and transparent.
-- For production-grade fairness you would replace with a verifiable RNG (e.g., Chainlink VRF or commit-reveal).
-- The contract uses `blockhash(block.number - 1)` to avoid `blockhash(block.number)` correctness pitfalls.
+## Contract
 
----
+Source: [`src/TreasureHunt.sol`](src/TreasureHunt.sol). Built on OpenZeppelin's `Ownable` for owner-gated funds management.
 
-## ✅ Why this design
+### State
 
-- Simplicity: grid operations are O(1) per move. Treasure moves are inexpensive (constant work).
-- Deterministic: every move and treasure update is on-chain and reproducible given the chain history.
-- Frontend friendly: all game state (player positions, treasure pos, winner) is readable via public getters.
-- Testability: Foundry tests can warp time and simulate moves deterministically.
+- `playerPos` (public mapping `address` to `Position`): each player's `(row, col)` on the grid.
+- `treasure` (private `Position`): the hidden target cell, set at deployment and updated as the game runs.
+- `winner` (public `address`): the address that last landed on the treasure.
+- `joinFee` (uint256): ETH required to join, fixed at deployment.
 
----
+### Functions
 
-## 🔍 Public API & events
+- `constructor(uint256 _joinFee) payable` deploys the contract, sets the owner to the deployer, requires a non-zero `_joinFee` and a non-zero initial ETH reserve, and seeds the treasure position from `block.number`, `block.timestamp`, and the previous block hash.
+- `joinGame() external payable` joins the game on payment of at least `joinFee`, then assigns the caller a pseudo-random starting cell derived from their address.
+- `move(uint8 nextRow, uint8 nextCol) external` moves the caller one adjacent cell (up, down, left, or right). It rejects out-of-bounds or non-adjacent moves, updates the caller's position, and either declares them the winner (if the new cell holds the treasure) or relocates the treasure.
+- `getTreasure() public view returns (uint8, uint8)` returns the treasure's current `(row, col)`.
+- `getWinner() public view returns (address)` returns the current winner address.
+- `withdraw() external onlyOwner` lets the owner withdraw the contract's remaining balance.
 
-### Core functions
-- `constructor(uint256 _joinFee) payable` — deploy with initial ETH reserve and required join fee.
-- `joinGame()` payable — join the game by paying `joinFee` (assigns player a random starting position).
-- `move(uint8 nextRow, uint8 nextCol)` — move one step to an adjacent cell; triggers treasure move and winner check.
-- `getTreasure() public view returns (uint8, uint8)` — returns treasure coordinates.
-- `playerPos(address) public view returns (uint8 row, uint8 col)` — player position mapping (public).
-- `getWinner() public view returns (address)` — returns current winner (if any).
-- `withdraw()` onlyOwner — withdraw contract funds (leftover / reserve).
+Internal helpers: `isValidMove` (bounds and adjacency check), `moveTreasure` (applies the treasure rules), `moveToAdjacent` (shifts the treasure one random cell), `moveToRandom` (teleports the treasure), `declareWinner` (pays out and re-seeds), and `isPrime` (primality test used by the treasure rules).
 
 ### Events
+
 - `PlayerMoved(address indexed player, uint8 row, uint8 col)`
 - `WinnerDeclared(address indexed player, uint256 reward)`
 
-These allow a frontend to reconstruct game state by subscribing to events.
+A front end can reconstruct game progress by subscribing to these events alongside the public getters.
 
----
+## How the hunt works
 
-## 🧪 Tests (Foundry)
+1. **Deploy.** The contract is deployed with a `joinFee` and an initial ETH reserve. The treasure's starting cell is seeded from on-chain values.
+2. **Join.** A player calls `joinGame()` with at least `joinFee` in ETH and is placed at a pseudo-random starting cell keyed to their address and the current block.
+3. **Move.** A player calls `move(nextRow, nextCol)` to step to an adjacent cell. The move is rejected unless the target cell is in bounds and exactly one step away (horizontally or vertically, not diagonally).
+4. **Check for a win first.** If the player's new cell matches the treasure's cell, the game immediately declares them the winner and pays out. No treasure movement happens on a winning move.
+5. **Otherwise, move the treasure.** The contract converts the player's new cell to an index `pos = row * 10 + col`, then applies two rules:
+   - If `pos` is a multiple of 5, the treasure shifts one cell in a pseudo-random direction (it stays put if that direction would push it off the grid edge).
+   - If `pos` is a prime number, the treasure teleports to a fresh pseudo-random cell.
+   Both rules can apply on the same move.
+6. **Payout.** On a win, the winner receives 90% of the contract balance and 10% remains as reserve. The treasure is re-seeded so play can continue.
 
-Included test file: `test/TreasureHuntsTest.t.sol` with tests for:
+The owner can reclaim leftover funds with `withdraw()`.
 
-- `testJoinGame` — join assigns valid random position in `[0..9]` for both row & col.
-- `testMove` — players can move to adjacent cells and state updates.
-- `testMoveTreasure` — a basic test that triggers treasure movement (validate invariants manually or via assertions).
+### Notes on randomness and limitations
 
-**Run tests:**
+Randomness comes entirely from `keccak256` over `block.timestamp`, `block.number`, and `blockhash(block.number - 1)`. This is deterministic and transparent, which is good for verifiability and easy testing, but it is not secure against an actor who can influence block timing or transaction ordering. A production version would swap in a verifiable source such as Chainlink VRF or a commit-reveal scheme.
 
-```bash
-forge test
-```
+The contract is a learning and portfolio project. One known quirk worth flagging: `joinGame()` treats a stored position of `(0, 0)` as "not joined", and `move` does not require prior registration, so the cell at index 0 is a special case. These are intentional rough edges left visible rather than papered over.
 
-Run tests with gas report:
-```bash
-forge test --gas-report
-```
+## Tech stack
 
-Coverage:
-```bash
-forge coverage
-```
+- **Solidity** `^0.8.20`
+- **Foundry** (`forge`) for building, testing, and gas reporting
+- **OpenZeppelin Contracts** (`Ownable`) for ownership and fund withdrawal
 
-- Aim for strong coverage; add tests for edge cases:
-
-- Moving at grid bounds (0 and 9)
-
-- Prime detection around small numbers (2,3,5,7,11,...)
-
-- Multiple players joining and moving
-
-- Winner path and payout correctness (including balance checks)
-
----
-
-## 🛠 Build / Run / Deploy
+## Getting started
 
 ### Prerequisites
 
-- Install Foundry: https://book.getfoundry.sh/getting-started/installation
+Install Foundry by following the [official guide](https://book.getfoundry.sh/getting-started/installation).
+
+### Install dependencies
+
+```bash
+forge install
+```
 
 ### Build
+
 ```bash
 forge build
 ```
 
 ### Test
+
 ```bash
 forge test
 ```
 
+## Testing
 
-## Gas & Complexity (worst-case notes)
+Tests live in [`test/treasureHunt.t.sol`](test/treasureHunt.t.sol) and use Foundry's cheatcodes (`vm.deal`, `vm.prank`) to fund and impersonate players against a freshly deployed contract.
 
-- ```joinGame()```
+| Test | What it checks |
+| --- | --- |
+| `testJoinGame` | A player who pays the join fee is assigned a valid starting cell, with `row` and `col` both inside `[0, 9]`. |
+| `testMove` | A joined player can step to an adjacent cell, and `playerPos` reflects the new coordinates. |
+| `testMoveTreasure` | A join-then-move sequence runs end to end without reverting, exercising the treasure-movement path. |
 
-  - Executes a few ```keccak256``` calls and assigns ```playerPos```.
+Run with a gas report:
 
-  - Cost: moderate (constant).
+```bash
+forge test --gas-report
+```
 
-- ```move()```
+Measure coverage:
 
-  - Validates adjacency (constant checks) and updates player mapping.
+```bash
+forge coverage
+```
 
-  - Calls ```moveTreasure()``` which can call ```moveToAdjacent()``` or ```moveToRandom()``` — constant work.
+Suggested areas to extend coverage: grid-boundary moves (rows and columns at 0 and 9), prime detection around small values, multiple players joining and moving, and the full winner path with payout and balance assertions.
 
-  - Emits events. Overall constant gas per move.
+## Author
 
-- ```moveToAdjacent()``` / ```moveToRandom()```:
-
-  - Constant cost (few SLOAD/SSTORE + keccak calls).
-
-- Worst-case per block: no heavy loops over players in current design → gas is bounded per call.
-
-Note: The contract stores players by mapping, not an array, so it's cheap per-player. If you later add arrays to iterate over players, costs would increase with player count.
+Krish Ojha
